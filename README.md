@@ -21,7 +21,33 @@ or:
 pipx install git+https://github.com/suifengwudong/opencode-session-search
 ```
 
+If `ses` is not on PATH, run `uv tool update-shell` and open a new terminal. The OpenCode plugin uses the absolute path, so it works either way.
+
 From a clone, `python ses.py` and `ses.cmd` work without installing anything.
+
+## OpenCode plugin
+
+The plugin registers a `session_search` tool and a `/ses` command. It calls the `ses` CLI, so the installation script installs both.
+
+Windows:
+
+```powershell
+git clone https://github.com/suifengwudong/opencode-session-search
+cd opencode-session-search
+./install.ps1
+opencode reload
+```
+
+macOS and Linux:
+
+```bash
+git clone https://github.com/suifengwudong/opencode-session-search
+cd opencode-session-search
+./install.sh
+opencode reload
+```
+
+Then ask the agent "Find the session where we discussed X", or run `/ses X`. The plugin is optional; the CLI works on its own.
 
 ## Usage
 
