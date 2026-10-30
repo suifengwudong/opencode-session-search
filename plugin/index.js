@@ -32,6 +32,7 @@ function buildArgs(input) {
   if (input.directory) args.push("-d", input.directory)
   if (input.since) args.push("--since", input.since)
   if (input.until) args.push("--until", input.until)
+  if (input.all_time) args.push("--all-time")
   if (input.assistant) args.push("-a")
   if (input.include_children) args.push("--all")
   if (input.include_current) args.push("--include-current")
@@ -55,7 +56,7 @@ function format(items) {
 export const sessionSearchTool = {
   name: "session_search",
   description:
-    "Search the user's OpenCode session history across every project. Use this when the user refers to a past conversation, asks what was discussed before, or cannot find an old session. It matches session titles and user prompts; set assistant=true to also search assistant replies (slower). Returns session ids, directories, timestamps, snippets, and the command to resume. An empty query lists the most recent sessions.",
+    "Search the user's OpenCode session history across every project. Use this when the user refers to a past conversation, asks what was discussed before, or cannot find an old session. It matches session titles and user prompts over the last 90 days by default; pass since to widen the window or all_time to search the whole history. Set assistant=true to also search assistant replies (slower). Returns session ids, directories, timestamps, snippets, and the command to resume. An empty query lists the most recent sessions.",
   input: {
     type: "object",
     properties: {
@@ -69,11 +70,16 @@ export const sessionSearchTool = {
       },
       since: {
         type: "string",
-        description: "Start time: 30d, 12h, 2w, 2026-09-01, or an ISO timestamp.",
+        description: "Start time: 30d, 12h, 2w, 2026-09-01, or an ISO timestamp. Defaults to 90 days ago.",
       },
       until: {
         type: "string",
         description: "End time, same formats as since.",
+      },
+      all_time: {
+        type: "boolean",
+        default: false,
+        description: "Search the whole history instead of the last 90 days.",
       },
       assistant: {
         type: "boolean",

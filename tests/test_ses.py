@@ -27,11 +27,26 @@ CREATE TABLE session_message (
     time_updated INTEGER NOT NULL,
     data TEXT NOT NULL
 );
+CREATE TABLE part (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    data TEXT NOT NULL
+);
 """
+
+SHIFT = datetime.now().replace(microsecond=0) - datetime(2026, 10, 20, 12, 0, 0)
+BLOB = "iVBORw0KGgo" + "A" * 2048
+
+
+def iso(text):
+    return (datetime.fromisoformat(text) + SHIFT).isoformat()
 
 
 def stamp(text):
-    return int(datetime.fromisoformat(text).timestamp() * 1000)
+    return int((datetime.fromisoformat(text) + SHIFT).timestamp() * 1000)
 
 
 def user(text, when):
@@ -104,6 +119,15 @@ def db(tmp_path, monkeypatch):
             "2026-10-20T11:45:00",
             None,
         ),
+        (
+            "ses_old",
+            None,
+            "远古会话",
+            "F:/archive",
+            "2025-06-01T10:00:00",
+            "2025-06-01T10:30:00",
+            None,
+        ),
     ]
     for sid, parent, title, directory, created, updated, archived in sessions:
         con.execute(
@@ -173,6 +197,20 @@ def db(tmp_path, monkeypatch):
             "2026-10-20T11:40:00",
             user("benchmark", stamp("2026-10-20T11:40:00")),
         ),
+        (
+            "m7",
+            "ses_lit",
+            "user",
+            "2026-10-20T10:12:00",
+            json.dumps({"text": "附图", "files": [{"data": BLOB}], "agents": []}),
+        ),
+        (
+            "m8",
+            "ses_old",
+            "user",
+            "2025-06-01T10:10:00",
+            user("远古话题", stamp("2025-06-01T10:10:00")),
+        ),
     ]
     for mid, sid, kind, when, data in messages:
         con.execute(
@@ -180,6 +218,19 @@ def db(tmp_path, monkeypatch):
             "time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (mid, sid, kind, 0, stamp(when), stamp(when), data),
         )
+
+    con.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "p1",
+            "m2",
+            "ses_lit",
+            stamp("2026-10-20T10:11:00"),
+            stamp("2026-10-20T10:11:00"),
+            json.dumps({"type": "file", "uri": "data:image/png;base64," + BLOB}),
+        ),
+    )
 
     con.commit()
     con.close()
@@ -242,11 +293,11 @@ def test_directory_filter(db, capsys):
 
 
 def test_time_filter(db, capsys):
-    assert run(db, "清华", "--since", "2026-10-20T10:30:00") == 0
+    assert run(db, "清华", "--since", iso("2026-10-20T10:30:00")) == 0
     out = capsys.readouterr().out
     assert "work选择" in out
 
-    assert run(db, "清华", "--since", "2026-10-20T11:30:00") == 1
+    assert run(db, "清华", "--since", iso("2026-10-20T11:30:00")) == 1
 
 
 def test_multiple_keywords_are_anded(db, capsys):
@@ -315,3 +366,44 @@ def test_show_rejects_ambiguous_prefix(db):
 def test_show_rejects_unknown_id(db):
     with pytest.raises(SystemExit):
         ses.main(["show", "ses_missing", "--db", str(db)])
+
+
+def test_default_window_skips_old_sessions(db, capsys):
+    assert run(db, "远古话题") == 1
+    err = capsys.readouterr().err
+    assert "last 90 days" in err
+
+    assert run(db, "远古话题", "--all-time") == 0
+    assert "远古会话" in capsys.readouterr().out
+
+
+def test_compact_dry_run_keeps_payloads(db, capsys):
+    assert ses.main(["compact", "--db", str(db), "--dry-run"]) == 0
+    assert "dry run" in capsys.readouterr().out
+    con = sqlite3.connect(db)
+    message = con.execute("SELECT data FROM session_message WHERE id = 'm7'").fetchone()
+    con.close()
+    assert BLOB in message[0]
+
+
+def test_compact_removes_tool_payloads(db):
+    assert ses.main(["compact", "--db", str(db)]) == 0
+    con = sqlite3.connect(db)
+    message = con.execute("SELECT data FROM session_message WHERE id = 'm7'").fetchone()
+    part = con.execute("SELECT data FROM part WHERE id = 'p1'").fetchone()
+    con.close()
+
+    payload = json.loads(message[0])
+    assert payload["text"] == "附图"
+    assert payload["files"][0]["data"] == BLOB
+    assert BLOB in message[0]
+    assert BLOB not in part[0]
+    assert "removed-base64:" in part[0]
+    assert "removed-base64:" not in message[0]
+
+
+def test_compact_is_idempotent(db, capsys):
+    assert ses.main(["compact", "--db", str(db)]) == 0
+    capsys.readouterr()
+    assert ses.main(["compact", "--db", str(db)]) == 0
+    assert "total: 0 payloads, 0 B saved" in capsys.readouterr().out

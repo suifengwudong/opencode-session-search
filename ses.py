@@ -11,6 +11,9 @@ DEFAULT_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 MAX_MS = 2**63 - 1
 SNIPPET_WIDTH = 64
 INDENT = " " * 18
+DEFAULT_WINDOW_DAYS = 90
+PAYLOAD_MIN_LENGTH = 1024
+BASE64_ONLY = re.compile(r"[A-Za-z0-9+/=\r\n]+")
 
 USER_SQL = """
 WITH rows AS (
@@ -78,6 +81,11 @@ def parse_when(value, end=False):
     return int(datetime.fromisoformat(value).timestamp() * 1000)
 
 
+def default_since():
+    seconds = DEFAULT_WINDOW_DAYS * 86400
+    return int((datetime.now().timestamp() - seconds) * 1000)
+
+
 def fmt_time(ms):
     return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
 
@@ -85,6 +93,22 @@ def fmt_time(ms):
 def like_pattern(keyword):
     escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+def looks_base64(value):
+    return bool(BASE64_ONLY.fullmatch(value[:512]))
+
+
+def payload_marker(key, value):
+    if len(value) < PAYLOAD_MIN_LENGTH:
+        return None
+    if value.startswith("data:") and ";base64," in value[:128]:
+        if looks_base64(value.partition(";base64,")[2]):
+            return f"removed-base64:{len(value)}"
+        return None
+    if key in ("data", "url", "uri") and looks_base64(value):
+        return f"removed-base64:{len(value)}"
+    return None
 
 
 def make_snippet(text, keywords, width=SNIPPET_WIDTH):
@@ -334,6 +358,88 @@ def show_session(con, prefix, prompt_count, palette):
     print(palette.dim(f"resume: opencode -s {sid}"))
 
 
+def strip_payloads(node, stats):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                marker = payload_marker(key, value)
+                if marker is None:
+                    continue
+                node[key] = marker
+                stats["payloads"] += 1
+                stats["saved"] += len(value) - len(marker)
+            else:
+                strip_payloads(value, stats)
+    elif isinstance(node, list):
+        for value in node:
+            if not isinstance(value, str):
+                strip_payloads(value, stats)
+
+
+def fmt_bytes(value):
+    for unit, scale in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if value >= scale:
+            return f"{value / scale:.1f} {unit}"
+    return f"{value} B"
+
+
+def compact_table(con, table, dry_run, condition=None):
+    stats = {"rows": 0, "changed": 0, "payloads": 0, "saved": 0}
+    where = f"{condition} AND " if condition else ""
+    last = ""
+    while True:
+        rows = con.execute(
+            f"SELECT id, data FROM {table} WHERE {where}id > ? ORDER BY id LIMIT 200",
+            (last,),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            last = row["id"]
+            stats["rows"] += 1
+            node = json.loads(row["data"])
+            before = stats["payloads"]
+            strip_payloads(node, stats)
+            if stats["payloads"] == before:
+                continue
+            stats["changed"] += 1
+            if not dry_run:
+                con.execute(
+                    f"UPDATE {table} SET data = ? WHERE id = ?",
+                    (
+                        json.dumps(node, ensure_ascii=False, separators=(",", ":")),
+                        row["id"],
+                    ),
+                )
+        if not dry_run:
+            con.commit()
+    return stats
+
+
+def compact(path, dry_run=False, vacuum=False):
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout = 30000")
+    total = {"rows": 0, "changed": 0, "payloads": 0, "saved": 0}
+    for table, condition in (("session_message", "type <> 'user'"), ("part", None)):
+        stats = compact_table(con, table, dry_run, condition)
+        for key in total:
+            total[key] += stats[key]
+        print(
+            f"{table}: {stats['rows']} rows scanned, {stats['changed']} rewritten, "
+            f"{stats['payloads']} payloads, {fmt_bytes(stats['saved'])} saved"
+        )
+    print(f"total: {total['payloads']} payloads, {fmt_bytes(total['saved'])} saved")
+    if dry_run:
+        print("dry run: nothing written")
+        con.close()
+        return
+    if vacuum:
+        con.execute("VACUUM")
+        print("vacuum: database rebuilt")
+    con.close()
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ses",
@@ -354,6 +460,11 @@ def build_parser():
         "--since", help="start time: 30d, 12h, 2w, 2026-09-01, or an ISO timestamp"
     )
     parser.add_argument("--until", help="end time, same formats as --since")
+    parser.add_argument(
+        "--all-time",
+        action="store_true",
+        help=f"search the whole history instead of the last {DEFAULT_WINDOW_DAYS} days",
+    )
     parser.add_argument(
         "-a",
         "--assistant",
@@ -391,6 +502,21 @@ def build_show_parser():
     return parser
 
 
+def build_compact_parser():
+    parser = argparse.ArgumentParser(
+        prog="ses compact",
+        description="Replace stored base64 tool payloads with short markers.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="report savings without writing"
+    )
+    parser.add_argument(
+        "--vacuum", action="store_true", help="rebuild the database afterwards"
+    )
+    parser.add_argument("--db", help="path to opencode.db")
+    return parser
+
+
 def color_enabled(no_color):
     return sys.stdout.isatty() and not no_color and "NO_COLOR" not in os.environ
 
@@ -403,10 +529,19 @@ def main(argv=None):
         con = connect(resolve_db(args.db))
         show_session(con, args.id, args.prompts, palette)
         return 0
+    if argv and argv[0] == "compact":
+        args = build_compact_parser().parse_args(argv[1:])
+        compact(resolve_db(args.db), dry_run=args.dry_run, vacuum=args.vacuum)
+        return 0
 
     args = build_parser().parse_args(argv)
     palette = Palette(color_enabled(args.no_color))
-    since_ms = parse_when(args.since) if args.since else 0
+    if args.all_time:
+        since_ms = 0
+    elif args.since:
+        since_ms = parse_when(args.since)
+    else:
+        since_ms = default_since()
     until_ms = parse_when(args.until, end=True) if args.until else MAX_MS
     keywords = [keyword for keyword in args.keywords if keyword]
 
@@ -447,6 +582,12 @@ def main(argv=None):
         print("no sessions found", file=sys.stderr)
         if keywords and not args.assistant:
             print("hint: add -a to search assistant replies", file=sys.stderr)
+        if keywords and not args.all_time and not args.since:
+            print(
+                f"hint: only the last {DEFAULT_WINDOW_DAYS} days were searched, "
+                "add --all-time for older sessions",
+                file=sys.stderr,
+            )
 
     return 0 if hits else 1
 
