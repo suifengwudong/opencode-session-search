@@ -398,8 +398,31 @@ def test_compact_removes_tool_payloads(db):
     assert payload["files"][0]["data"] == BLOB
     assert BLOB in message[0]
     assert BLOB not in part[0]
-    assert "removed-base64:" in part[0]
-    assert "removed-base64:" not in message[0]
+    assert "data:image/png;base64," in part[0]
+    assert "removed-base64:" not in part[0]
+
+
+def test_compact_repairs_legacy_markers(db):
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE part SET data = ? WHERE id = 'p1'",
+        (
+            json.dumps(
+                {"type": "file", "uri": "removed-base64:2048", "mime": "image/jpeg"}
+            ),
+        ),
+    )
+    con.commit()
+    con.close()
+
+    assert ses.main(["compact", "--db", str(db)]) == 0
+
+    con = sqlite3.connect(db)
+    part = con.execute("SELECT data FROM part WHERE id = 'p1'").fetchone()
+    con.close()
+    payload = json.loads(part[0])
+    assert payload["uri"].startswith("data:image/jpeg;base64,")
+    assert "removed-base64:" not in part[0]
 
 
 def test_compact_is_idempotent(db, capsys):

@@ -14,6 +14,13 @@ INDENT = " " * 18
 DEFAULT_WINDOW_DAYS = 90
 PAYLOAD_MIN_LENGTH = 1024
 BASE64_ONLY = re.compile(r"[A-Za-z0-9+/=\r\n]+")
+PAYLOAD_MARKER = re.compile(r"removed-base64:\d+")
+PLACEHOLDERS = {
+    "image/png": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "image/jpeg": "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AVN//2Q==",
+    "application/pdf": "JVBERi0xLjQKMSAwIG9iago8PC9UeXBlIC9DYXRhbG9nIC9QYWdlcyAyIDAgUj4+CmVuZG9iagoyIDAgb2JqCjw8L1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDE+PgplbmRvYmoKMyAwIG9iago8PC9UeXBlIC9QYWdlIC9QYXJlbnQgMiAwIFIgL01lZGlhQm94IFswIDAgMyAzXT4+CmVuZG9iagp4cmVmCjAgNAowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1MiAwMDAwMCBuIAowMDAwMDAwMTAxIDAwMDAwIG4gCnRyYWlsZXIKPDwvU2l6ZSA0L1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMTUwCiUlRU9G",
+}
+DEFAULT_MIME = "image/png"
 
 USER_SQL = """
 WITH rows AS (
@@ -99,15 +106,22 @@ def looks_base64(value):
     return bool(BASE64_ONLY.fullmatch(value[:512]))
 
 
-def payload_marker(key, value):
+def placeholder(mime):
+    mime = mime or DEFAULT_MIME
+    return f"data:{mime};base64,{PLACEHOLDERS.get(mime, PLACEHOLDERS[DEFAULT_MIME])}"
+
+
+def payload_marker(key, value, mime=None):
+    if key in ("data", "url", "uri") and PAYLOAD_MARKER.fullmatch(value):
+        return placeholder(mime)
     if len(value) < PAYLOAD_MIN_LENGTH:
         return None
     if value.startswith("data:") and ";base64," in value[:128]:
         if looks_base64(value.partition(";base64,")[2]):
-            return f"removed-base64:{len(value)}"
+            return placeholder(mime or value[5:].partition(";base64,")[0])
         return None
     if key in ("data", "url", "uri") and looks_base64(value):
-        return f"removed-base64:{len(value)}"
+        return placeholder(mime)
     return None
 
 
@@ -360,14 +374,15 @@ def show_session(con, prefix, prompt_count, palette):
 
 def strip_payloads(node, stats):
     if isinstance(node, dict):
+        mime = node.get("mime") if isinstance(node.get("mime"), str) else None
         for key, value in node.items():
             if isinstance(value, str):
-                marker = payload_marker(key, value)
+                marker = payload_marker(key, value, mime)
                 if marker is None:
                     continue
                 node[key] = marker
                 stats["payloads"] += 1
-                stats["saved"] += len(value) - len(marker)
+                stats["saved"] += max(0, len(value) - len(marker))
             else:
                 strip_payloads(value, stats)
     elif isinstance(node, list):
